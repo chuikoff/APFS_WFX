@@ -184,6 +184,7 @@ void ApfsVFS::InvalidateDrives()
     std::lock_guard<std::mutex> lock(m_mutex);
     m_drives_scanned = false;
     m_open_volumes.clear();
+    m_open_hfs_volumes.clear();
 }
 
 std::shared_ptr<CachedVolume> ApfsVFS::GetOrMountVolume(int drive_num, unsigned int vol_index, const std::string &vol_name)
@@ -305,15 +306,6 @@ HANDLE ApfsVFS::FindFirst(const WCHAR *path, WIN32_FIND_DATAW *findData)
         m_cached_drives = DriveEnumerator::EnumerateApfsDrives(&m_access_denied_occurred);
         m_drives_scanned = true;
 
-        // Virtual "О программе" item
-        {
-            WIN32_FIND_DATAW fd = {};
-            fd.dwFileAttributes = FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_READONLY;
-            wcscpy_s(fd.cFileName, L"[О программе - Mac APFS].txt");
-            fd.nFileSizeLow = static_cast<DWORD>(GetAboutText().size());
-            ctx->entries.push_back(fd);
-        }
-
         if (m_cached_drives.empty())
         {
             WIN32_FIND_DATAW fd = {};
@@ -409,107 +401,160 @@ HANDLE ApfsVFS::FindFirst(const WCHAR *path, WIN32_FIND_DATAW *findData)
             return INVALID_HANDLE_VALUE;
         }
 
-        auto cv = GetOrMountVolume(found_drive->drive_number, found_vol->volume_index, found_vol->volume_name);
-        if (!cv || !cv->dir)
+        if (found_vol->fs_type == FsType::HFSPlus)
         {
-            SetLastError(ERROR_NOT_READY);
-            return INVALID_HANDLE_VALUE;
-        }
-
-        std::vector<std::string> subpath;
-        for (size_t i = 2; i < parts.size(); i++)
-        {
-            subpath.push_back(WideToUtf8(parts[i]));
-        }
-
-        uint64_t target_inode = ROOT_DIR_INO_NUM;
-        ApfsDir::Inode target_rec;
-        if (!subpath.empty())
-        {
-            if (!ResolvePath(*cv, subpath, target_inode, target_rec))
+            auto chv = GetOrMountHfsVolume(found_drive->drive_number, found_vol->volume_offset, found_vol->sector_size);
+            if (!chv || !chv->volume)
             {
-                SetLastError(ERROR_PATH_NOT_FOUND);
+                SetLastError(ERROR_NOT_READY);
                 return INVALID_HANDLE_VALUE;
+            }
+
+            uint32_t parentCNID = HfsPlus::kHFSPlusRootFolderID;
+            if (parts.size() > 2)
+            {
+                std::vector<std::wstring> subparts(parts.begin() + 2, parts.end());
+                HfsPlus::CatalogItem dirItem;
+                if (!ResolveHfsPath(*chv->volume, subparts, dirItem) || !dirItem.isDir)
+                {
+                    SetLastError(ERROR_PATH_NOT_FOUND);
+                    return INVALID_HANDLE_VALUE;
+                }
+                parentCNID = dirItem.cnid;
+            }
+
+            std::vector<HfsPlus::CatalogItem> hfsItems;
+            chv->volume->ListDirectory(parentCNID, hfsItems);
+
+            for (const auto &hitem : hfsItems)
+            {
+                if (hitem.name.empty()) continue;
+                WIN32_FIND_DATAW fd = {};
+                wcsncpy_s(fd.cFileName, hitem.name.c_str(), _TRUNCATE);
+
+                if (hitem.isDir)
+                {
+                    fd.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+                }
+                else
+                {
+                    fd.dwFileAttributes = FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_READONLY;
+                    uint64_t fsize = hitem.dataSize;
+                    fd.nFileSizeLow  = (DWORD)(fsize & 0xFFFFFFFF);
+                    fd.nFileSizeHigh = (DWORD)(fsize >> 32);
+                }
+
+                fd.ftCreationTime   = HfsPlus::HfsPlusTimeToFileTime(hitem.createTime);
+                fd.ftLastWriteTime  = HfsPlus::HfsPlusTimeToFileTime(hitem.modifyTime);
+                fd.ftLastAccessTime = fd.ftLastWriteTime;
+
+                ctx->entries.push_back(fd);
             }
         }
         else
         {
-            // Volume root level: check if Inode 2 has entries
-            std::vector<ApfsDir::DirRec> test_list;
-            if (!cv->dir->ListDirectory(test_list, ROOT_DIR_INO_NUM) || test_list.empty())
+            auto cv = GetOrMountVolume(found_drive->drive_number, found_vol->volume_index, found_vol->volume_name);
+            if (!cv || !cv->dir)
             {
-                std::vector<ApfsDir::DirRec> parent_list;
-                if (cv->dir->ListDirectory(parent_list, ROOT_DIR_PARENT) && !parent_list.empty())
-                {
-                    bool found_root = false;
-                    for (const auto &p : parent_list)
-                    {
-                        if (p.name == "root")
-                        {
-                            target_inode = p.file_id;
-                            found_root = true;
-                            break;
-                        }
-                    }
-                    if (!found_root)
-                        target_inode = ROOT_DIR_PARENT;
-                }
-            }
-        }
-
-        std::vector<ApfsDir::DirRec> dir_list;
-        cv->dir->ListDirectory(dir_list, target_inode);
-
-        for (const auto &item : dir_list)
-        {
-            if (item.name == "." || item.name == "..")
-                continue;
-
-            WIN32_FIND_DATAW fd = {};
-            std::wstring item_name_w = Utf8ToWide(item.name);
-            wcsncpy_s(fd.cFileName, item_name_w.c_str(), _TRUNCATE);
-
-            ApfsDir::Inode item_ino;
-            bool has_ino = cv->dir->GetInode(item_ino, item.file_id);
-
-            uint16_t drec_type = (item.flags & DREC_TYPE_MASK);
-            bool is_dir = (drec_type == 4);
-            if (has_ino && !is_dir)
-            {
-                is_dir = ((item_ino.mode & 0170000) == 0040000);
+                SetLastError(ERROR_NOT_READY);
+                return INVALID_HANDLE_VALUE;
             }
 
-            if (has_ino)
+            std::vector<std::string> subpath;
+            for (size_t i = 2; i < parts.size(); i++)
             {
-                if (is_dir)
-                {
-                    fd.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-                }
-                else
-                {
-                    fd.dwFileAttributes = FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_READONLY;
-                    uint64_t fsize = item_ino.uncompressed_size;
-                    if ((item_ino.optional_present_flags & ApfsDir::Inode::INO_HAS_DSTREAM) && fsize == 0)
-                    {
-                        fsize = item_ino.ds_size;
-                    }
-                    fd.nFileSizeLow = (DWORD)(fsize & 0xFFFFFFFF);
-                    fd.nFileSizeHigh = (DWORD)(fsize >> 32);
-                }
+                subpath.push_back(WideToUtf8(parts[i]));
+            }
 
-                fd.ftCreationTime = ApfsNsToFileTime(item_ino.create_time);
-                fd.ftLastWriteTime = ApfsNsToFileTime(item_ino.mod_time);
-                fd.ftLastAccessTime = ApfsNsToFileTime(item_ino.access_time);
+            uint64_t target_inode = ROOT_DIR_INO_NUM;
+            ApfsDir::Inode target_rec;
+            if (!subpath.empty())
+            {
+                if (!ResolvePath(*cv, subpath, target_inode, target_rec))
+                {
+                    SetLastError(ERROR_PATH_NOT_FOUND);
+                    return INVALID_HANDLE_VALUE;
+                }
             }
             else
             {
-                if (is_dir)
-                    fd.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-                else
-                    fd.dwFileAttributes = FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_READONLY;
+                // Volume root level: check if Inode 2 has entries
+                std::vector<ApfsDir::DirRec> test_list;
+                if (!cv->dir->ListDirectory(test_list, ROOT_DIR_INO_NUM) || test_list.empty())
+                {
+                    std::vector<ApfsDir::DirRec> parent_list;
+                    if (cv->dir->ListDirectory(parent_list, ROOT_DIR_PARENT) && !parent_list.empty())
+                    {
+                        bool found_root = false;
+                        for (const auto &p : parent_list)
+                        {
+                            if (p.name == "root")
+                            {
+                                target_inode = p.file_id;
+                                found_root = true;
+                                break;
+                            }
+                        }
+                        if (!found_root)
+                            target_inode = ROOT_DIR_PARENT;
+                    }
+                }
             }
 
-            ctx->entries.push_back(fd);
+            std::vector<ApfsDir::DirRec> dir_list;
+            cv->dir->ListDirectory(dir_list, target_inode);
+
+            for (const auto &item : dir_list)
+            {
+                if (item.name == "." || item.name == "..")
+                    continue;
+
+                WIN32_FIND_DATAW fd = {};
+                std::wstring item_name_w = Utf8ToWide(item.name);
+                wcsncpy_s(fd.cFileName, item_name_w.c_str(), _TRUNCATE);
+
+                ApfsDir::Inode item_ino;
+                bool has_ino = cv->dir->GetInode(item_ino, item.file_id);
+
+                uint16_t drec_type = (item.flags & DREC_TYPE_MASK);
+                bool is_dir = (drec_type == 4);
+                if (has_ino && !is_dir)
+                {
+                    is_dir = ((item_ino.mode & 0170000) == 0040000);
+                }
+
+                if (has_ino)
+                {
+                    if (is_dir)
+                    {
+                        fd.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+                    }
+                    else
+                    {
+                        fd.dwFileAttributes = FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_READONLY;
+                        uint64_t fsize = item_ino.uncompressed_size;
+                        if ((item_ino.optional_present_flags & ApfsDir::Inode::INO_HAS_DSTREAM) && fsize == 0)
+                        {
+                            fsize = item_ino.ds_size;
+                        }
+                        fd.nFileSizeLow = (DWORD)(fsize & 0xFFFFFFFF);
+                        fd.nFileSizeHigh = (DWORD)(fsize >> 32);
+                    }
+
+                    fd.ftCreationTime = ApfsNsToFileTime(item_ino.create_time);
+                    fd.ftLastWriteTime = ApfsNsToFileTime(item_ino.mod_time);
+                    fd.ftLastAccessTime = ApfsNsToFileTime(item_ino.access_time);
+                }
+                else
+                {
+                    if (is_dir)
+                        fd.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+                    else
+                        fd.dwFileAttributes = FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_READONLY;
+                }
+
+                ctx->entries.push_back(fd);
+            }
         }
     }
 
@@ -557,21 +602,6 @@ int ApfsVFS::GetFile(const WCHAR *remoteName, const WCHAR *localName, int copyFl
 
     std::vector<std::wstring> parts = SplitPath(remoteName);
 
-    // Virtual "О программе" text file
-    if (parts.size() == 1 && (wcsstr(parts[0].c_str(), L"О программе") != nullptr || wcsstr(parts[0].c_str(), L"About") != nullptr))
-    {
-        std::string text = GetAboutText();
-        HANDLE hFile = CreateFileW(localName, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile != INVALID_HANDLE_VALUE)
-        {
-            DWORD written = 0;
-            WriteFile(hFile, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
-            CloseHandle(hFile);
-            return FS_FILE_OK;
-        }
-        return FS_FILE_WRITEERROR;
-    }
-
     if (parts.size() < 3)
         return FS_FILE_NOTFOUND;
 
@@ -600,6 +630,69 @@ int ApfsVFS::GetFile(const WCHAR *remoteName, const WCHAR *localName, int copyFl
     }
     if (!found_vol)
         return FS_FILE_NOTFOUND;
+
+    // --- Route by filesystem type ---
+    if (found_vol->fs_type == FsType::HFSPlus)
+    {
+        auto chv = GetOrMountHfsVolume(found_drive->drive_number, found_vol->volume_offset, found_vol->sector_size);
+        if (!chv || !chv->volume)
+            return FS_FILE_READERROR;
+
+        std::vector<std::wstring> subpartsW(parts.begin() + 2, parts.end());
+        HfsPlus::CatalogItem hfsItem;
+        if (!ResolveHfsPath(*chv->volume, subpartsW, hfsItem) || hfsItem.isDir)
+            return FS_FILE_NOTFOUND;
+
+        DWORD creationDisp = (copyFlags & FS_COPYFLAGS_OVERWRITE) ? CREATE_ALWAYS : CREATE_NEW;
+        HANDLE hLocal = CreateFileW(localName, GENERIC_WRITE, 0, nullptr, creationDisp, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hLocal == INVALID_HANDLE_VALUE)
+        {
+            DWORD err = GetLastError();
+            return (err == ERROR_FILE_EXISTS) ? FS_FILE_EXISTS : FS_FILE_WRITEERROR;
+        }
+
+        uint64_t total_size = hfsItem.dataSize;
+        constexpr size_t CHUNK = 256 * 1024;
+        std::vector<uint8_t> buf(CHUNK);
+        uint64_t offset = 0;
+        bool ok = true;
+
+        while (offset < total_size)
+        {
+            uint64_t toRead = std::min<uint64_t>(CHUNK, total_size - offset);
+            uint64_t bytesRead = 0;
+            if (!chv->volume->ReadFileData(hfsItem, offset, buf.data(), toRead, bytesRead) || bytesRead == 0)
+            {
+                ok = false;
+                break;
+            }
+            DWORD written = 0;
+            if (!WriteFile(hLocal, buf.data(), (DWORD)bytesRead, &written, nullptr) || written != bytesRead)
+            {
+                ok = false;
+                break;
+            }
+            offset += bytesRead;
+
+            if (m_progressProc && total_size > 0)
+            {
+                int pct = (int)((offset * 100) / total_size);
+                if (m_progressProc(m_pluginNr, const_cast<WCHAR*>(remoteName), const_cast<WCHAR*>(localName), pct) != 0)
+                {
+                    CloseHandle(hLocal);
+                    DeleteFileW(localName);
+                    return FS_FILE_USERABORT;
+                }
+            }
+        }
+
+        FILETIME ftMod = HfsPlus::HfsPlusTimeToFileTime(hfsItem.modifyTime);
+        FILETIME ftCre = HfsPlus::HfsPlusTimeToFileTime(hfsItem.createTime);
+        SetFileTime(hLocal, &ftCre, nullptr, &ftMod);
+        CloseHandle(hLocal);
+        if (!ok) { DeleteFileW(localName); return FS_FILE_READERROR; }
+        return FS_FILE_OK;
+    }
 
     auto cv = GetOrMountVolume(found_drive->drive_number, found_vol->volume_index, found_vol->volume_name);
     if (!cv || !cv->dir)
@@ -728,6 +821,25 @@ bool ApfsVFS::ReadFileData(const WCHAR *remoteName, std::vector<uint8_t> &out_da
     if (!found_vol)
         return false;
 
+    // --- Route by filesystem type ---
+    if (found_vol->fs_type == FsType::HFSPlus)
+    {
+        auto chv = GetOrMountHfsVolume(found_drive->drive_number, found_vol->volume_offset, found_vol->sector_size);
+        if (!chv || !chv->volume) return false;
+
+        std::vector<std::wstring> subpartsW(parts.begin() + 2, parts.end());
+        HfsPlus::CatalogItem hfsItem;
+        if (!ResolveHfsPath(*chv->volume, subpartsW, hfsItem) || hfsItem.isDir) return false;
+
+        uint64_t fsize = hfsItem.dataSize;
+        if (fsize == 0 || fsize > max_bytes) return false;
+        out_data.resize((size_t)fsize);
+        uint64_t bytesRead = 0;
+        bool ok = chv->volume->ReadFileData(hfsItem, 0, out_data.data(), fsize, bytesRead);
+        if (!ok || bytesRead != fsize) { out_data.clear(); return false; }
+        return true;
+    }
+
     auto cv = GetOrMountVolume(found_drive->drive_number, found_vol->volume_index, found_vol->volume_name);
     if (!cv || !cv->dir)
         return false;
@@ -837,20 +949,22 @@ std::string ApfsVFS::GetAboutText()
 {
     return
         "======================================================================\r\n"
-        " Total Commander macOS APFS File System Plugin (WFX)\r\n"
-        " Версия: 1.1.0 (x64 / x86)\r\n"
+        " Total Commander macOS File System Plugin (WFX)\r\n"
+        " Поддержка: Apple APFS & HFS+ (Mac OS Extended)\r\n"
+        " Версия: 1.2.0 (x64 / x86)\r\n"
         " Автор: chuikoff\r\n"
         " GitHub: https://github.com/chuikoff/APFS_WFX\r\n"
         "======================================================================\r\n\r\n"
         "Плагин предназначен для прямого просмотра, чтения и извлечения файлов\r\n"
         "с физических накопителей (USB-флешек, внешних SSD/HDD), отформатированных\r\n"
-        "в файловой системе Apple APFS (macOS High Sierra — Sequoia).\r\n\r\n"
+        "в файловых системах Apple APFS (macOS High Sierra — Sequoia) и\r\n"
+        "HFS+ / Mac OS Extended (macOS Yosemite — Sequoia).\r\n\r\n"
         "Ключевые возможности:\r\n"
         "- Прямой доступ к физическим дискам Windows (\\\\.\\PhysicalDriveX).\r\n"
-        "- Автоматический поиск GPT-разделов с GUID APFS-контейнеров.\r\n"
-        "- Поддержка нескольких томов (Macintosh HD, Data, Preboot, Recovery).\r\n"
-        "- Корректное отображение русских и Unicode-имен файлов.\r\n"
+        "- Автоматический поиск GPT и MBR разделов с APFS и HFS+.\r\n"
+        "- Поддержка томов APFS и HFS+ (включая каталоги B-Tree).\r\n"
         "- Прозрачная декомпрессия сжатых файлов macOS Decmpfs (LZVN, LZFSE, ZLIB).\r\n"
+        "- Корректное отображение русских и Unicode-имен файлов.\r\n"
         "- Поддержка быстрого просмотра эскизов (Thumbnails / Ctrl+Shift+F1).\r\n"
         "- Режим работы строго Только для чтения (Read-Only) — безопасно для данных.\r\n\r\n"
         "Горячие клавиши Total Commander:\r\n"
@@ -858,7 +972,7 @@ std::string ApfsVFS::GetAboutText()
         "- F5: Копирование файлов/папок на диск Windows\r\n"
         "- Enter: Открытие файла в ассоциированной программе Windows\r\n"
         "- Ctrl+R: Обновление списка подключенных дисков\r\n"
-        "- Alt+Enter: Свойства / Окно \"О программе\"\r\n\r\n"
+        "- Alt+Enter: Свойства плагина / Окно \"О программе\"\r\n\r\n"
         "======================================================================\r\n";
 }
 
@@ -879,15 +993,15 @@ void ApfsVFS::ShowAboutDialog(HWND hWnd)
         tc.hwndParent = hWnd;
         tc.hInstance = m_hInstance;
         tc.dwFlags = TDF_ENABLE_HYPERLINKS | TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION;
-        tc.pszWindowTitle = L"О плагине — Mac APFS Plugin";
-        tc.pszMainInstruction = L"Total Commander macOS APFS File System Plugin";
+        tc.pszWindowTitle = L"О плагине — macOS File System Plugin";
+        tc.pszMainInstruction = L"Total Commander macOS File System Plugin (APFS & HFS+)";
         tc.pszContent =
-            L"Версия: 1.1.0 (x64 / x86)\n"
+            L"Версия: 1.2.0 (x64 / x86)\n"
             L"Разработчик: chuikoff\n"
             L"GitHub: <a href=\"https://github.com/chuikoff/APFS_WFX\">https://github.com/chuikoff/APFS_WFX</a>\n\n"
             L"Возможности:\n"
             L"• Прямой доступ к физическим накопителям и USB-дискам macOS\n"
-            L"• Распознавание GPT-разделов и контейнеров Apple APFS\n"
+            L"• Распознавание разделов Apple APFS и HFS+ (Mac OS Extended)\n"
             L"• Поддержка нескольких томов (Macintosh HD, Data, Recovery и др.)\n"
             L"• Декомпрессия сжатых файлов Apple Decmpfs (LZVN, LZFSE, ZLIB)\n"
             L"• Быстрый просмотр эскизов для фото (GDI+) и медиафайлов\n"
@@ -927,14 +1041,15 @@ void ApfsVFS::ShowAboutDialog(HWND hWnd)
 
     // Fallback MessageBox
     std::wstring msg =
-        L"Total Commander macOS APFS Plugin v1.1.0\n"
+        L"Total Commander macOS File System Plugin v1.2.0\n"
+        L"Поддержка: Apple APFS & HFS+ (Mac OS Extended)\n"
         L"Разработчик: chuikoff\n"
         L"GitHub: https://github.com/chuikoff/APFS_WFX\n\n"
-        L"Прямой доступ к физическим накопителям и USB-дискам macOS APFS.\n"
+        L"Прямой доступ к физическим накопителям и USB-дискам macOS.\n"
         L"Режим: Только для чтения (Read-Only).\n"
         L"Требуются права Администратора для доступа к PhysicalDrive.\n\n"
         L"Нажмите ОК для перехода на страницу GitHub.";
-    int res = MessageBoxW(hWnd, msg.c_str(), L"О плагине Mac APFS", MB_OKCANCEL | MB_ICONINFORMATION);
+    int res = MessageBoxW(hWnd, msg.c_str(), L"О плагине macOS File System", MB_OKCANCEL | MB_ICONINFORMATION);
     if (res == IDOK)
     {
         ShellExecuteW(hWnd, L"open", L"https://github.com/chuikoff/APFS_WFX", nullptr, nullptr, SW_SHOWNORMAL);
@@ -943,8 +1058,7 @@ void ApfsVFS::ShowAboutDialog(HWND hWnd)
 
 int ApfsVFS::ExecuteFile(HWND hWnd, const WCHAR *remoteName, const WCHAR *verb)
 {
-    if ((remoteName && (wcsstr(remoteName, L"О программе") != nullptr || wcsstr(remoteName, L"About") != nullptr)) ||
-        (verb && _wcsicmp(verb, L"properties") == 0))
+    if (verb && _wcsicmp(verb, L"properties") == 0)
     {
         ShowAboutDialog(hWnd);
         return FS_EXEC_OK;
@@ -992,4 +1106,67 @@ int ApfsVFS::ExtractCustomIcon(const WCHAR *remoteName, int extractFlags, HICON 
     }
 
     return FS_ICON_USEDEFAULT;
+}
+
+// ============================================================
+// HFS+ Volume Mount & Path Resolution
+// ============================================================
+
+std::shared_ptr<CachedHfsVolume> ApfsVFS::GetOrMountHfsVolume(int drive_num, uint64_t vol_offset, uint32_t sector_size)
+{
+    uint64_t key = (uint64_t)drive_num * 10000000ULL + vol_offset / (1024 * 1024);
+    auto it = m_open_hfs_volumes.find(key);
+    if (it != m_open_hfs_volumes.end() && it->second && it->second->volume && it->second->volume->IsOpen())
+        return it->second;
+
+    std::wstring path = L"\\\\.\\PhysicalDrive" + std::to_wstring(drive_num);
+    HANDLE hRaw = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hRaw == INVALID_HANDLE_VALUE) return nullptr;
+
+    auto chv = std::make_shared<CachedHfsVolume>();
+    chv->hDevice = hRaw;
+    chv->drive_number = drive_num;
+    chv->volume_offset = vol_offset;
+    chv->sector_size = sector_size;
+    chv->volume = std::make_unique<HfsPlus::HfsPlusVolume>();
+
+    if (!chv->volume->Open(hRaw, vol_offset, 0, sector_size))
+    {
+        return nullptr;
+    }
+
+    m_open_hfs_volumes[key] = chv;
+    return chv;
+}
+
+bool ApfsVFS::FindHfsCatalogItem(HfsPlus::HfsPlusVolume &vol, uint32_t parentCNID, const std::wstring &name, HfsPlus::CatalogItem &out)
+{
+    std::vector<HfsPlus::CatalogItem> items;
+    if (!vol.ListDirectory(parentCNID, items)) return false;
+    for (auto &item : items) {
+        if (_wcsicmp(item.name.c_str(), name.c_str()) == 0) {
+            out = item;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ApfsVFS::ResolveHfsPath(HfsPlus::HfsPlusVolume &vol, const std::vector<std::wstring> &parts, HfsPlus::CatalogItem &out_item)
+{
+    uint32_t curCNID = HfsPlus::kHFSPlusRootFolderID;
+    HfsPlus::CatalogItem cur = {};
+    cur.isDir = true;
+    cur.cnid = curCNID;
+
+    for (size_t i = 0; i < parts.size(); i++) {
+        HfsPlus::CatalogItem child;
+        if (!FindHfsCatalogItem(vol, curCNID, parts[i], child))
+            return false;
+        cur = child;
+        curCNID = cur.cnid;
+    }
+    out_item = cur;
+    return true;
 }

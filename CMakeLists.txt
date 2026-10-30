@@ -94,6 +94,7 @@ set(PLUGIN_SOURCES
     src/plugin_main.cpp
     src/apfs_vfs.cpp
     src/drive_enumerator.cpp
+    src/hfsplus_reader.cpp
     src/apfs.def
     res/resource.rc
 )

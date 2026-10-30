@@ -3,11 +3,25 @@
 #include <ApfsLib/GptPartitionMap.h>
 #include <ApfsLib/ApfsContainer.h>
 #include <ApfsLib/DiskStruct.h>
+#include "hfsplus_reader.h"
 
 #include <iostream>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+
+// GPT type GUID for HFS+ (Apple HFS) partition
+// {48465300-0000-11AA-AA11-00306543ECAC}
+// Stored in mixed-endian GPT format: first 3 groups LE, last 2 groups BE
+static const uint8_t kGptTypeHFSPlus[16] = {
+    0x00,0x53,0x46,0x48, 0x00,0x00, 0xAA,0x11, 0xAA,0x11, 0x00,0x30,0x65,0x43,0xEC,0xAC
+};
+
+// GPT type GUID for APFS container
+// {7C3457EF-0000-11AA-AA11-00306543ECAC}
+static const uint8_t kGptTypeAPFS[16] = {
+    0xEF,0x57,0x34,0x7C, 0x00,0x00, 0xAA,0x11, 0xAA,0x11, 0x00,0x30,0x65,0x43,0xEC,0xAC
+};
 
 std::wstring DriveEnumerator::FormatSize(uint64_t bytes)
 {
@@ -34,6 +48,16 @@ static std::wstring Utf8ToWide(const std::string &str)
     return res;
 }
 
+static std::string WideToUtf8(const std::wstring &str)
+{
+    if (str.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, str.c_str(), (int)str.size(), nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return "";
+    std::string res(len, 0);
+    WideCharToMultiByte(CP_UTF8, 0, str.c_str(), (int)str.size(), &res[0], len, nullptr, nullptr);
+    return res;
+}
+
 static void CleanString(std::string &s)
 {
     while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n'))
@@ -52,6 +76,129 @@ static void SanitizeName(std::wstring &name)
         if (c == L'/' || c == L'\\' || c == L':' || c == L'*' || c == L'?' || c == L'"' || c == L'<' || c == L'>' || c == L'|')
             c = L'_';
     }
+}
+
+#pragma pack(push, 1)
+struct GptHeader {
+    uint64_t signature;       // "EFI PART"
+    uint32_t revision;
+    uint32_t headerSize;
+    uint32_t headerCRC32;
+    uint32_t reserved;
+    uint64_t myLBA;
+    uint64_t alternateLBA;
+    uint64_t firstUsableLBA;
+    uint64_t lastUsableLBA;
+    uint8_t  diskGUID[16];
+    uint64_t partitionEntryLBA;
+    uint32_t numPartitionEntries;
+    uint32_t sizeOfPartitionEntry;
+    uint32_t partitionEntryArrayCRC32;
+};
+
+struct GptEntry {
+    uint8_t  partitionTypeGUID[16];
+    uint8_t  uniquePartitionGUID[16];
+    uint64_t startingLBA;
+    uint64_t endingLBA;
+    uint64_t attributes;
+    uint16_t partitionName[36];
+};
+
+struct MbrPartitionEntry {
+    uint8_t  bootIndicator;
+    uint8_t  startingCHS[3];
+    uint8_t  partitionType;
+    uint8_t  endingCHS[3];
+    uint32_t startingLBA;
+    uint32_t totalSectors;
+};
+#pragma pack(pop)
+
+static bool ReadSectors(HANDLE hDrive, uint64_t lba, uint32_t sectorSize, void* buf, uint32_t count)
+{
+    uint64_t offset = lba * sectorSize;
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)offset;
+    OVERLAPPED ov = {};
+    ov.Offset     = li.LowPart;
+    ov.OffsetHigh = li.HighPart;
+    DWORD read = 0;
+    uint32_t totalBytes = sectorSize * count;
+    if (!ReadFile(hDrive, buf, totalBytes, &read, &ov)) {
+        if (GetLastError() == ERROR_IO_PENDING)
+            GetOverlappedResult(hDrive, &ov, &read, TRUE);
+        else
+            return false;
+    }
+    return read == totalBytes;
+}
+
+struct HfsPlusPartInfo {
+    uint64_t startLBA;
+    uint64_t sizeLBA;
+};
+
+static std::vector<HfsPlusPartInfo> FindHFSPlusPartitions(HANDLE hDrive, uint32_t sectorSize, uint64_t driveSize)
+{
+    std::vector<HfsPlusPartInfo> result;
+
+    // 1. Check MBR (LBA 0)
+    std::vector<uint8_t> mbrBuf(sectorSize);
+    if (ReadSectors(hDrive, 0, sectorSize, mbrBuf.data(), 1)) {
+        if (mbrBuf[510] == 0x55 && mbrBuf[511] == 0xAA) {
+            for (int i = 0; i < 4; i++) {
+                const MbrPartitionEntry* p = reinterpret_cast<const MbrPartitionEntry*>(mbrBuf.data() + 446 + i * 16);
+                if (p->partitionType == 0xAF && p->totalSectors > 0) {
+                    HfsPlusPartInfo pi;
+                    pi.startLBA = p->startingLBA;
+                    pi.sizeLBA  = p->totalSectors;
+                    result.push_back(pi);
+                }
+            }
+        }
+    }
+
+    // 2. Check GPT (LBA 1)
+    std::vector<uint8_t> hdrBuf(sectorSize);
+    if (ReadSectors(hDrive, 1, sectorSize, hdrBuf.data(), 1)) {
+        const GptHeader* gptHdr = reinterpret_cast<const GptHeader*>(hdrBuf.data());
+        if (gptHdr->signature == 0x5452415020494645ULL) { // "EFI PART"
+            uint32_t numEntries = gptHdr->numPartitionEntries;
+            uint32_t entrySize  = gptHdr->sizeOfPartitionEntry;
+            uint64_t entryLBA   = gptHdr->partitionEntryLBA;
+
+            if (numEntries > 0 && entrySize >= sizeof(GptEntry) && numEntries <= 256) {
+                uint32_t totalBytes = numEntries * entrySize;
+                uint32_t sectors    = (totalBytes + sectorSize - 1) / sectorSize;
+                std::vector<uint8_t> entriesBuf(sectors * sectorSize);
+                if (ReadSectors(hDrive, entryLBA, sectorSize, entriesBuf.data(), sectors)) {
+                    for (uint32_t i = 0; i < numEntries; i++) {
+                        const GptEntry* entry = reinterpret_cast<const GptEntry*>(entriesBuf.data() + i * entrySize);
+                        if (memcmp(entry->partitionTypeGUID, kGptTypeHFSPlus, 16) == 0) {
+                            HfsPlusPartInfo pi;
+                            pi.startLBA = entry->startingLBA;
+                            pi.sizeLBA  = entry->endingLBA - entry->startingLBA + 1;
+                            result.push_back(pi);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. If no partitions found, probe bare disk at offset 0
+    if (result.empty() && driveSize > 0) {
+        HfsPlus::HfsPlusVolume probeVol;
+        if (probeVol.Open(hDrive, 0, driveSize, sectorSize)) {
+            HfsPlusPartInfo pi;
+            pi.startLBA = 0;
+            pi.sizeLBA  = driveSize / sectorSize;
+            result.push_back(pi);
+        }
+    }
+
+    return result;
 }
 
 bool DriveEnumerator::InspectDrive(int drive_num, ApfsDriveInfo &info, bool &access_denied)
@@ -129,55 +276,75 @@ bool DriveEnumerator::InspectDrive(int drive_num, ApfsDriveInfo &info, bool &acc
             model = vendor;
     }
 
+    // --- Scan for HFS+ partitions ---
+    std::vector<HfsPlusPartInfo> hfsParts = FindHFSPlusPartitions(hDrive, sector_size, drive_size);
+    std::vector<VolumeEntryInfo> hfsVolumes;
+    for (const auto &part : hfsParts)
+    {
+        uint64_t partOffset = part.startLBA * sector_size;
+        uint64_t partSize   = part.sizeLBA  * sector_size;
+
+        HfsPlus::HfsPlusVolume hfsVol;
+        if (hfsVol.Open(hDrive, partOffset, partSize, sector_size))
+        {
+            VolumeEntryInfo vol = {};
+            vol.volume_index = 0; // will be assigned below
+            vol.fs_type = FsType::HFSPlus;
+            vol.volume_offset = partOffset;
+            vol.sector_size = sector_size;
+            vol.volume_name_w = hfsVol.GetVolumeName();
+            if (vol.volume_name_w.empty()) vol.volume_name_w = L"HFS+ Volume";
+            SanitizeName(vol.volume_name_w);
+            vol.volume_name = WideToUtf8(vol.volume_name_w);
+            vol.total_bytes = hfsVol.GetVolumeSize() ? hfsVol.GetVolumeSize() : partSize;
+            vol.free_bytes  = 0;
+            hfsVolumes.push_back(vol);
+        }
+    }
+
     CloseHandle(hDrive);
 
-    // Open through DeviceWinPhys for APFS analysis
+    // --- Scan for APFS ---
     std::string utf8_path = "\\\\.\\PhysicalDrive" + std::to_string(drive_num);
     DeviceWinPhys dev;
-    if (!dev.Open(utf8_path.c_str()))
-        return false;
+    bool dev_open = dev.Open(utf8_path.c_str());
 
     uint64_t apfs_offset = 0;
     uint64_t apfs_size = 0;
     bool found_apfs = false;
 
-    GptPartitionMap gpt;
-    if (gpt.LoadAndVerify(dev))
+    if (dev_open)
     {
-        int part_idx = gpt.FindFirstAPFSPartition();
-        if (part_idx != -1 && gpt.GetPartitionOffsetAndSize(part_idx, apfs_offset, apfs_size))
+        GptPartitionMap gpt;
+        if (gpt.LoadAndVerify(dev))
         {
-            found_apfs = true;
-        }
-    }
-
-    // Also check if whole disk is directly an APFS container
-    if (!found_apfs)
-    {
-        uint8_t sb_buf[512] = { 0 };
-        if (dev.Read(sb_buf, 0, sizeof(sb_buf)))
-        {
-            const nx_superblock_t *sb = reinterpret_cast<const nx_superblock_t *>(sb_buf);
-            if (sb->nx_magic == NX_MAGIC)
+            int part_idx = gpt.FindFirstAPFSPartition();
+            if (part_idx != -1 && gpt.GetPartitionOffsetAndSize(part_idx, apfs_offset, apfs_size))
             {
                 found_apfs = true;
-                apfs_offset = 0;
-                apfs_size = drive_size;
+            }
+        }
+
+        // Also check if whole disk is directly an APFS container
+        if (!found_apfs)
+        {
+            uint8_t sb_buf[512] = { 0 };
+            if (dev.Read(sb_buf, 0, sizeof(sb_buf)))
+            {
+                const nx_superblock_t *sb = reinterpret_cast<const nx_superblock_t *>(sb_buf);
+                if (sb->nx_magic == NX_MAGIC)
+                {
+                    found_apfs = true;
+                    apfs_offset = 0;
+                    apfs_size = drive_size;
+                }
             }
         }
     }
 
-    if (!found_apfs)
+    if (!found_apfs && hfsVolumes.empty())
     {
-        dev.Close();
-        return false;
-    }
-
-    // Attempt to initialize APFS container
-    ApfsContainer container(&dev, apfs_offset, apfs_size);
-    if (!container.Init())
-    {
-        dev.Close();
+        if (dev_open) dev.Close();
         return false;
     }
 
@@ -186,7 +353,8 @@ bool DriveEnumerator::InspectDrive(int drive_num, ApfsDriveInfo &info, bool &acc
     info.model_name = model;
     info.drive_size = drive_size;
     info.is_usb = is_usb;
-    info.has_apfs = true;
+    info.has_apfs = found_apfs;
+    info.has_hfsplus = !hfsVolumes.empty();
     info.apfs_offset = apfs_offset;
     info.apfs_size = apfs_size;
 
@@ -200,31 +368,49 @@ bool DriveEnumerator::InspectDrive(int drive_num, ApfsDriveInfo &info, bool &acc
     SanitizeName(display);
     info.display_name = display;
 
-    // Discover volumes
-    for (unsigned int fsid = 0; fsid < NX_MAX_FILE_SYSTEMS; fsid++)
+    // Discover APFS volumes
+    if (found_apfs && dev_open)
     {
-        apfs_superblock_t apsb = {};
-        if (container.GetVolumeInfo(fsid, apsb))
+        ApfsContainer container(&dev, apfs_offset, apfs_size);
+        if (container.Init())
         {
-            VolumeEntryInfo vol = {};
-            vol.volume_index = fsid;
-            const char *name_ptr = reinterpret_cast<const char *>(apsb.apfs_volname);
-            if (name_ptr && name_ptr[0] != 0)
-                vol.volume_name = name_ptr;
-            else
-                vol.volume_name = "Volume_" + std::to_string(fsid);
+            for (unsigned int fsid = 0; fsid < NX_MAX_FILE_SYSTEMS; fsid++)
+            {
+                apfs_superblock_t apsb = {};
+                if (container.GetVolumeInfo(fsid, apsb))
+                {
+                    VolumeEntryInfo vol = {};
+                    vol.volume_index = (unsigned int)info.volumes.size();
+                    vol.fs_type = FsType::APFS;
+                    const char *name_ptr = reinterpret_cast<const char *>(apsb.apfs_volname);
+                    if (name_ptr && name_ptr[0] != 0)
+                        vol.volume_name = name_ptr;
+                    else
+                        vol.volume_name = "Volume_" + std::to_string(fsid);
 
-            vol.volume_name_w = Utf8ToWide(vol.volume_name);
-            SanitizeName(vol.volume_name_w);
-            vol.total_bytes = apfs_size;
-            vol.free_bytes = container.GetFreeBlocks() * container.GetBlocksize();
+                    vol.volume_name_w = Utf8ToWide(vol.volume_name);
+                    SanitizeName(vol.volume_name_w);
+                    vol.total_bytes = apfs_size;
+                    vol.free_bytes = container.GetFreeBlocks() * container.GetBlocksize();
+                    vol.volume_offset = apfs_offset;
+                    vol.sector_size = sector_size;
 
-            info.volumes.push_back(vol);
+                    info.volumes.push_back(vol);
+                }
+            }
         }
     }
 
-    dev.Close();
-    return true;
+    if (dev_open) dev.Close();
+
+    // Add HFS+ volumes
+    for (auto &hvol : hfsVolumes)
+    {
+        hvol.volume_index = (unsigned int)info.volumes.size();
+        info.volumes.push_back(hvol);
+    }
+
+    return !info.volumes.empty();
 }
 
 std::vector<ApfsDriveInfo> DriveEnumerator::EnumerateApfsDrives(bool *pAccessDeniedOccurred)

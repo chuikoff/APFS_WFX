@@ -316,7 +316,7 @@ HANDLE ApfsVFS::FindFirst(const WCHAR *path, WIN32_FIND_DATAW *findData)
             }
             else
             {
-                wcscpy_s(fd.cFileName, L"[No APFS drives detected - Connect Mac USB drive and press Ctrl+R].txt");
+                wcscpy_s(fd.cFileName, L"[No Mac drives detected (APFS / HFS+) - Connect Mac USB drive and press Ctrl+R].txt");
             }
             ctx->entries.push_back(fd);
         }

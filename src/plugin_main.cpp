@@ -29,7 +29,7 @@ void __stdcall FsGetDefRootName(char* DefRootName, int maxlen)
 {
     if (DefRootName && maxlen > 0)
     {
-        strncpy_s(DefRootName, maxlen, "Mac APFS Drives", _TRUNCATE);
+        strncpy_s(DefRootName, maxlen, "Mac Drives (APFS & HFS+)", _TRUNCATE);
     }
 }
 

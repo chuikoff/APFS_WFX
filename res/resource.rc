@@ -4,8 +4,8 @@
 IDI_APFS_ICON ICON "apfs.ico"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,1,0,0
-PRODUCTVERSION 1,1,0,0
+FILEVERSION 1,2,0,0
+PRODUCTVERSION 1,2,0,0
 FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
 FILEFLAGS 0x1L
@@ -21,13 +21,13 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "chuikoff"
-            VALUE "FileDescription", "Total Commander macOS APFS File System Plugin (WFX)"
-            VALUE "FileVersion", "1.1.0.0"
+            VALUE "FileDescription", "Total Commander macOS File System Plugin (APFS & HFS+)"
+            VALUE "FileVersion", "1.2.0.0"
             VALUE "InternalName", "apfs"
             VALUE "LegalCopyright", "Copyright (C) 2026 chuikoff. All rights reserved."
             VALUE "OriginalFilename", "apfs.wfx"
-            VALUE "ProductName", "Total Commander APFS Plugin"
-            VALUE "ProductVersion", "1.1.0.0"
+            VALUE "ProductName", "Total Commander macOS Plugin (APFS & HFS+)"
+            VALUE "ProductVersion", "1.2.0.0"
         END
     END
     BLOCK "VarFileInfo"

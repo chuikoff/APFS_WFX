@@ -1,0 +1,19 @@
+EXPORTS
+    FsGetDefRootName
+    FsInit
+    FsInitW
+    FsFindFirst
+    FsFindFirstW
+    FsFindNext
+    FsFindNextW
+    FsFindClose
+    FsGetFile
+    FsGetFileW
+    FsExecuteFile
+    FsExecuteFileW
+    FsStatusInfo
+    FsStatusInfoW
+    FsGetPreviewBitmap
+    FsGetPreviewBitmapW
+    FsExtractCustomIcon
+    FsExtractCustomIconW

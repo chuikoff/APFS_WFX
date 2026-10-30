@@ -1,0 +1,6 @@
+[plugininstall]
+description=macOS APFS File System Plugin (Read-only USB / Disk drives)
+type=wfx
+file=apfs.wfx
+file64=apfs.wfx64
+defaultdir=tc_apfs

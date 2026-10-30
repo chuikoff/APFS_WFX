@@ -1,0 +1,27 @@
+# Build outputs
+build/
+build32/
+bin/
+obj/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+
+# IDE & Visual Studio
+.vs/
+*.user
+*.suo
+.idea/
+.vscode/
+
+# Temp & Artifacts
+dist/
+*.zip
+*.wfx
+*.wfx64
+*.tmp
+*~
+Thumbs.db

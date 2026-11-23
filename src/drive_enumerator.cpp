@@ -17,12 +17,6 @@ static const uint8_t kGptTypeHFSPlus[16] = {
     0x00,0x53,0x46,0x48, 0x00,0x00, 0xAA,0x11, 0xAA,0x11, 0x00,0x30,0x65,0x43,0xEC,0xAC
 };
 
-// GPT type GUID for APFS container
-// {7C3457EF-0000-11AA-AA11-00306543ECAC}
-static const uint8_t kGptTypeAPFS[16] = {
-    0xEF,0x57,0x34,0x7C, 0x00,0x00, 0xAA,0x11, 0xAA,0x11, 0x00,0x30,0x65,0x43,0xEC,0xAC
-};
-
 std::wstring DriveEnumerator::FormatSize(uint64_t bytes)
 {
     const wchar_t *units[] = { L"B", L"KB", L"MB", L"GB", L"TB" };
@@ -398,6 +392,63 @@ bool DriveEnumerator::InspectDrive(int drive_num, ApfsDriveInfo &info, bool &acc
                     info.volumes.push_back(vol);
                 }
             }
+        }
+        else
+        {
+            // Container Init failed. Check reason (e.g. Fusion Drive)
+            uint8_t sb_buf[4096] = { 0 };
+            bool is_fusion = false;
+            if (dev.Read(sb_buf, apfs_offset, sizeof(sb_buf)))
+            {
+                const nx_superblock_t *sb = reinterpret_cast<const nx_superblock_t *>(sb_buf);
+                if (sb->nx_magic == NX_MAGIC && (sb->nx_incompatible_features & NX_INCOMPAT_FUSION))
+                {
+                    is_fusion = true;
+                }
+            }
+
+            VolumeEntryInfo vol = {};
+            vol.volume_index = (unsigned int)info.volumes.size();
+            vol.volume_offset = apfs_offset;
+            vol.sector_size = sector_size;
+            vol.total_bytes = apfs_size;
+            vol.free_bytes = 0;
+
+            if (is_fusion)
+            {
+                vol.fs_type = FsType::UnsupportedFusion;
+                vol.volume_name = "Apple Fusion Drive (Missing SSD Partner)";
+                vol.volume_name_w = L"[Apple Fusion Drive - Missing SSD Partner]";
+                vol.status_message =
+                    "Apple Fusion Drive (APFS Container)\r\n"
+                    "===================================\r\n\r\n"
+                    "Status: Companion SSD partner drive is missing.\r\n"
+                    "Drive: PhysicalDrive" + std::to_string(drive_num) + " (" + model + ")\r\n"
+                    "Container size: " + std::to_string(apfs_size / (1024ULL * 1024ULL * 1024ULL)) + " GB\r\n"
+                    "Container offset: " + std::to_string(apfs_offset) + " bytes\r\n\r\n"
+                    "Technical details:\r\n"
+                    "This disk contains an APFS container configured as an Apple Fusion Drive\r\n"
+                    "(NX_INCOMPAT_FUSION feature flag is set).\r\n"
+                    "In Apple Fusion Drives, filesystem metadata and fast-tier blocks are stored\r\n"
+                    "on the internal SSD, while bulk data is stored on this HDD.\r\n\r\n"
+                    "To access files in this container:\r\n"
+                    "Connect BOTH the SSD and HDD from this Mac to your PC at the same time.\r\n";
+            }
+            else
+            {
+                vol.fs_type = FsType::Error;
+                vol.volume_name = "APFS Container (Mount Failed)";
+                vol.volume_name_w = L"[APFS Container - Mount Failed]";
+                vol.status_message =
+                    "APFS Container Mount Error\r\n"
+                    "==========================\r\n\r\n"
+                    "The APFS container on PhysicalDrive" + std::to_string(drive_num) + " could not be initialized.\r\n\r\n"
+                    "Possible causes:\r\n"
+                    "1. The container is encrypted with FileVault 2.\r\n"
+                    "2. The filesystem requires unsupported feature flags.\r\n"
+                    "3. The container metadata or checkpoint map is damaged.\r\n";
+            }
+            info.volumes.push_back(vol);
         }
     }
 

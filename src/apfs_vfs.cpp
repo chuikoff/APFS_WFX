@@ -401,6 +401,29 @@ HANDLE ApfsVFS::FindFirst(const WCHAR *path, WIN32_FIND_DATAW *findData)
             return INVALID_HANDLE_VALUE;
         }
 
+        if (found_vol->fs_type == FsType::UnsupportedFusion || found_vol->fs_type == FsType::Error)
+        {
+            if (parts.size() == 2)
+            {
+                WIN32_FIND_DATAW fd = {};
+                fd.dwFileAttributes = FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_READONLY;
+                if (found_vol->fs_type == FsType::UnsupportedFusion)
+                    wcscpy_s(fd.cFileName, L"Fusion_Drive_Instructions.txt");
+                else
+                    wcscpy_s(fd.cFileName, L"APFS_Mount_Error_Info.txt");
+
+                fd.nFileSizeLow = (DWORD)found_vol->status_message.size();
+                fd.nFileSizeHigh = 0;
+                ctx->entries.push_back(fd);
+
+                *findData = ctx->entries[0];
+                ctx->current_index = 1;
+                return reinterpret_cast<HANDLE>(ctx.release());
+            }
+            SetLastError(ERROR_NO_MORE_FILES);
+            return INVALID_HANDLE_VALUE;
+        }
+
         if (found_vol->fs_type == FsType::HFSPlus)
         {
             auto chv = GetOrMountHfsVolume(found_drive->drive_number, found_vol->volume_offset, found_vol->sector_size);
@@ -632,6 +655,28 @@ int ApfsVFS::GetFile(const WCHAR *remoteName, const WCHAR *localName, int copyFl
         return FS_FILE_NOTFOUND;
 
     // --- Route by filesystem type ---
+    if (found_vol->fs_type == FsType::UnsupportedFusion || found_vol->fs_type == FsType::Error)
+    {
+        if (parts.size() == 3)
+        {
+            const std::string &msg = found_vol->status_message;
+            DWORD creationDisp = (copyFlags & FS_COPYFLAGS_OVERWRITE) ? CREATE_ALWAYS : CREATE_NEW;
+            HANDLE hLocal = CreateFileW(localName, GENERIC_WRITE, 0, nullptr, creationDisp, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hLocal == INVALID_HANDLE_VALUE)
+            {
+                DWORD err = GetLastError();
+                return (err == ERROR_FILE_EXISTS) ? FS_FILE_EXISTS : FS_FILE_WRITEERROR;
+            }
+            DWORD written = 0;
+            WriteFile(hLocal, msg.data(), (DWORD)msg.size(), &written, nullptr);
+            CloseHandle(hLocal);
+            if (m_progressProc)
+                m_progressProc(m_pluginNr, const_cast<WCHAR*>(remoteName), const_cast<WCHAR*>(localName), 100);
+            return FS_FILE_OK;
+        }
+        return FS_FILE_NOTFOUND;
+    }
+
     if (found_vol->fs_type == FsType::HFSPlus)
     {
         auto chv = GetOrMountHfsVolume(found_drive->drive_number, found_vol->volume_offset, found_vol->sector_size);
@@ -822,6 +867,18 @@ bool ApfsVFS::ReadFileData(const WCHAR *remoteName, std::vector<uint8_t> &out_da
         return false;
 
     // --- Route by filesystem type ---
+    if (found_vol->fs_type == FsType::UnsupportedFusion || found_vol->fs_type == FsType::Error)
+    {
+        if (parts.size() == 3)
+        {
+            const std::string &msg = found_vol->status_message;
+            size_t copyBytes = std::min(max_bytes, msg.size());
+            out_data.assign(msg.data(), msg.data() + copyBytes);
+            return true;
+        }
+        return false;
+    }
+
     if (found_vol->fs_type == FsType::HFSPlus)
     {
         auto chv = GetOrMountHfsVolume(found_drive->drive_number, found_vol->volume_offset, found_vol->sector_size);

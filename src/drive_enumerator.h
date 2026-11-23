@@ -10,6 +10,8 @@
 enum class FsType {
     APFS,
     HFSPlus,
+    UnsupportedFusion,
+    Error,
     Unknown
 };
 
@@ -19,9 +21,10 @@ struct VolumeEntryInfo {
     std::wstring volume_name_w;    // Wide string for TC
     uint64_t total_bytes;
     uint64_t free_bytes;
-    FsType   fs_type;             // APFS or HFSPlus
+    FsType   fs_type;             // APFS, HFSPlus, UnsupportedFusion, Error
     uint64_t volume_offset;       // byte offset on device (for HFS+)
     uint32_t sector_size;
+    std::string status_message;   // Detailed description or error info
 };
 
 struct ApfsDriveInfo {

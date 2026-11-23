@@ -66,6 +66,7 @@ void HfsPlusVolume::Close()
 {
     m_open = false;
     m_hDevice = INVALID_HANDLE_VALUE;
+    m_nodeCache.clear();
 }
 
 bool HfsPlusVolume::RawRead(uint64_t byteOffset, void *buf, uint32_t len)
@@ -239,11 +240,31 @@ ForkData HfsPlusVolume::ParseFork(const HFSPlusForkData &src)
 bool HfsPlusVolume::ReadBTreeNode(const ForkData &fork, uint32_t nodeIndex, uint32_t nodeSize,
                                    std::vector<uint8_t> &out)
 {
+    uint64_t cacheKey = 0;
+    if (!fork.extents.empty()) {
+        cacheKey = ((uint64_t)fork.extents[0].startBlock << 32) | nodeIndex;
+        for (const auto &entry : m_nodeCache) {
+            if (entry.first == cacheKey) {
+                out = entry.second;
+                return true;
+            }
+        }
+    }
+
     out.resize(nodeSize);
     // nodeIndex * nodeSize = byte offset within fork
     uint64_t byteOffset = (uint64_t)nodeIndex * nodeSize;
     uint64_t br = 0;
-    return ReadForkData(fork, byteOffset, out.data(), nodeSize, br);
+    if (!ReadForkData(fork, byteOffset, out.data(), nodeSize, br))
+        return false;
+
+    if (cacheKey != 0) {
+        if (m_nodeCache.size() >= 64) {
+            m_nodeCache.erase(m_nodeCache.begin());
+        }
+        m_nodeCache.push_back({ cacheKey, out });
+    }
+    return true;
 }
 
 // Overload for ReadBTreeNode that doesn't use the last-bytes-read trick:
@@ -482,35 +503,32 @@ bool HfsPlusVolume::LoadDecmpfsAttr(uint32_t cnid, CatalogItem &item)
 
             // Found! Parse attribute record data
             uint32_t dataOff = recOff + 2 + keyLen;
-            if (dataOff + 4 > nodeSize) continue;
+            if (dataOff + 16 > nodeSize) continue;
 
-            // Attribute record: type(4) + reserved(12) + attrData...
-            // type 0x10 = inline data, type 0x20 = fork data
+            uint16_t nextOff = (r + 1 < numRec) ? BE16(nd + nodeSize - (r + 2) * 2) : (nodeSize - 2 * (numRec + 1));
+            if (nextOff > nodeSize || dataOff + 16 > nextOff) continue;
+
+            // Attribute record: type(4) + reserved(8) + attrSize(4) + attrData...
+            // type 0x10 = inline data
             uint32_t attrRecType = BE32(nd + dataOff);
             if (attrRecType == 0x10) {
-                // Inline: type(4) + reserved(12) = 16 bytes header, then data
+                uint32_t attrSize = BE32(nd + dataOff + 12);
                 uint32_t inlineDataOff = dataOff + 16;
-                if (inlineDataOff + 16 > nodeSize) continue;
+                if (inlineDataOff + attrSize > nextOff || inlineDataOff + attrSize > nodeSize) continue;
+                if (attrSize < 16) continue; // Must contain at least decmpfs header
 
                 const uint8_t *ad = nd + inlineDataOff;
                 // decmpfs header: magic "fpmc" (little-endian) + method(4) + unpackedSize(8)
-                uint32_t magic = ad[0]|(uint32_t)ad[1]<<8|(uint32_t)ad[2]<<16|(uint32_t)ad[3]<<24;
+                uint32_t magic = ad[0]|((uint32_t)ad[1]<<8)|((uint32_t)ad[2]<<16)|((uint32_t)ad[3]<<24);
                 if (magic != 0x636D7066) continue; // "fpmc" LE
 
-                item.decmpfsMethod      = ad[4]|(uint32_t)ad[5]<<8|(uint32_t)ad[6]<<16|(uint32_t)ad[7]<<24;
-                item.decmpfsUnpackedSize= (uint64_t)(ad[8]|(uint32_t)ad[9]<<8|(uint32_t)ad[10]<<16|(uint32_t)ad[11]<<24) |
-                                          ((uint64_t)(ad[12]|(uint32_t)ad[13]<<8|(uint32_t)ad[14]<<16|(uint32_t)ad[15]<<24) << 32);
+                item.decmpfsMethod      = ad[4]|((uint32_t)ad[5]<<8)|((uint32_t)ad[6]<<16)|((uint32_t)ad[7]<<24);
+                item.decmpfsUnpackedSize= (uint64_t)(ad[8]|((uint32_t)ad[9]<<8)|((uint32_t)ad[10]<<16)|((uint32_t)ad[11]<<24)) |
+                                          ((uint64_t)(ad[12]|((uint32_t)ad[13]<<8)|((uint32_t)ad[14]<<16)|((uint32_t)ad[15]<<24)) << 32);
                 item.hasDecmpfs = true;
 
                 // Copy remaining attribute bytes (compressed data)
-                uint32_t attrDataEnd = 0;
-                if (r + 1 < numRec) {
-                    uint16_t nextOff = BE16(nd + nodeSize - (r+2)*2);
-                    if (nextOff > inlineDataOff) attrDataEnd = nextOff;
-                }
-                if (attrDataEnd == 0) attrDataEnd = nodeSize - 2*(numRec+1);
-                uint32_t attrPayloadSize = (attrDataEnd > inlineDataOff + 16) ?
-                                           (attrDataEnd - inlineDataOff - 16) : 0;
+                uint32_t attrPayloadSize = attrSize - 16;
                 if (attrPayloadSize > 0 && attrPayloadSize < 64*1024) {
                     item.decmpfsAttrData.assign(ad + 16, ad + 16 + attrPayloadSize);
                 }

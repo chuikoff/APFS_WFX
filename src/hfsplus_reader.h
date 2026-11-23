@@ -213,6 +213,9 @@ private:
 
     // Attributes B-Tree lookup for decmpfs
     bool LoadDecmpfsAttr(uint32_t cnid, CatalogItem &item);
+
+    // Node cache: (forkFirstBlock << 32) | nodeIndex -> node data
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> m_nodeCache;
 };
 
 } // namespace HfsPlus

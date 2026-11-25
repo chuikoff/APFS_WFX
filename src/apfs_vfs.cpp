@@ -1058,7 +1058,7 @@ std::string ApfsVFS::GetAboutText()
         "======================================================================\r\n"
         " Total Commander macOS File System Plugin (WFX)\r\n"
         " Поддержка: Apple APFS & HFS+ (Mac OS Extended)\r\n"
-        " Версия: 1.2.0 (x64 / x86)\r\n"
+        " Версия: 1.2.1 (x64 / x86)\r\n"
         " Автор: chuikoff\r\n"
         " GitHub: https://github.com/chuikoff/APFS_WFX\r\n"
         "======================================================================\r\n\r\n"
@@ -1103,7 +1103,7 @@ void ApfsVFS::ShowAboutDialog(HWND hWnd)
         tc.pszWindowTitle = L"О плагине — macOS File System Plugin";
         tc.pszMainInstruction = L"Total Commander macOS File System Plugin (APFS & HFS+)";
         tc.pszContent =
-            L"Версия: 1.2.0 (x64 / x86)\n"
+            L"Версия: 1.2.1 (x64 / x86)\n"
             L"Разработчик: chuikoff\n"
             L"GitHub: <a href=\"https://github.com/chuikoff/APFS_WFX\">https://github.com/chuikoff/APFS_WFX</a>\n\n"
             L"Возможности:\n"
@@ -1148,7 +1148,7 @@ void ApfsVFS::ShowAboutDialog(HWND hWnd)
 
     // Fallback MessageBox
     std::wstring msg =
-        L"Total Commander macOS File System Plugin v1.2.0\n"
+        L"Total Commander macOS File System Plugin v1.2.1\n"
         L"Поддержка: Apple APFS & HFS+ (Mac OS Extended)\n"
         L"Разработчик: chuikoff\n"
         L"GitHub: https://github.com/chuikoff/APFS_WFX\n\n"

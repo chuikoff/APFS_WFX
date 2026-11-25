@@ -113,3 +113,10 @@ set_target_properties(tc_apfs PROPERTIES
     PREFIX ""
     SUFFIX ".${PLUGIN_EXTENSION}"
 )
+
+add_executable(hfs_layout_test tests/hfs_layout_test.cpp src/hfsplus_reader.cpp)
+target_include_directories(hfs_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(hfs_layout_test PRIVATE apfslib)
+if (MSVC)
+    target_compile_definitions(hfs_layout_test PRIVATE NOMINMAX)
+endif()

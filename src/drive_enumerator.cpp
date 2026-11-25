@@ -72,6 +72,29 @@ static void SanitizeName(std::wstring &name)
     }
 }
 
+static void AssignUniqueVolumeName(const std::vector<VolumeEntryInfo> &existing, VolumeEntryInfo &vol)
+{
+    std::wstring base = vol.volume_name_w.empty() ? L"Volume" : vol.volume_name_w;
+    std::wstring name = base;
+    for (int n = 2; ; n++)
+    {
+        bool clash = false;
+        for (const auto &e : existing)
+        {
+            if (e.volume_name_w == name)
+            {
+                clash = true;
+                break;
+            }
+        }
+        if (!clash)
+            break;
+        name = base + L" (" + std::to_wstring(n) + L")";
+    }
+    vol.volume_name_w = name;
+    vol.volume_name = WideToUtf8(name);
+}
+
 #pragma pack(push, 1)
 struct GptHeader {
     uint64_t signature;       // "EFI PART"
@@ -162,7 +185,7 @@ static std::vector<HfsPlusPartInfo> FindHFSPlusPartitions(HANDLE hDrive, uint32_
             uint32_t entrySize  = gptHdr->sizeOfPartitionEntry;
             uint64_t entryLBA   = gptHdr->partitionEntryLBA;
 
-            if (numEntries > 0 && entrySize >= sizeof(GptEntry) && numEntries <= 256) {
+            if (numEntries > 0 && numEntries <= 256 && entrySize >= sizeof(GptEntry) && entrySize <= 512) {
                 uint32_t totalBytes = numEntries * entrySize;
                 uint32_t sectors    = (totalBytes + sectorSize - 1) / sectorSize;
                 std::vector<uint8_t> entriesBuf(sectors * sectorSize);
@@ -374,7 +397,7 @@ bool DriveEnumerator::InspectDrive(int drive_num, ApfsDriveInfo &info, bool &acc
                 if (container.GetVolumeInfo(fsid, apsb))
                 {
                     VolumeEntryInfo vol = {};
-                    vol.volume_index = (unsigned int)info.volumes.size();
+                    vol.volume_index = fsid;
                     vol.fs_type = FsType::APFS;
                     const char *name_ptr = reinterpret_cast<const char *>(apsb.apfs_volname);
                     if (name_ptr && name_ptr[0] != 0)
@@ -389,6 +412,7 @@ bool DriveEnumerator::InspectDrive(int drive_num, ApfsDriveInfo &info, bool &acc
                     vol.volume_offset = apfs_offset;
                     vol.sector_size = sector_size;
 
+                    AssignUniqueVolumeName(info.volumes, vol);
                     info.volumes.push_back(vol);
                 }
             }
@@ -448,6 +472,7 @@ bool DriveEnumerator::InspectDrive(int drive_num, ApfsDriveInfo &info, bool &acc
                     "2. The filesystem requires unsupported feature flags.\r\n"
                     "3. The container metadata or checkpoint map is damaged.\r\n";
             }
+            AssignUniqueVolumeName(info.volumes, vol);
             info.volumes.push_back(vol);
         }
     }
@@ -458,6 +483,7 @@ bool DriveEnumerator::InspectDrive(int drive_num, ApfsDriveInfo &info, bool &acc
     for (auto &hvol : hfsVolumes)
     {
         hvol.volume_index = (unsigned int)info.volumes.size();
+        AssignUniqueVolumeName(info.volumes, hvol);
         info.volumes.push_back(hvol);
     }
 

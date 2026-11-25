@@ -27,6 +27,8 @@ struct CachedVolume {
     std::unique_ptr<ApfsDir> dir;
     int drive_number;
     unsigned int volume_index;
+    bool root_known = false;
+    uint64_t root_inode = 2;
 };
 
 struct CachedHfsVolume {
@@ -77,6 +79,7 @@ private:
     ~ApfsVFS();
 
     std::shared_ptr<CachedVolume> GetOrMountVolume(int drive_num, unsigned int vol_index, const std::string &vol_name);
+    uint64_t VolumeRootInode(CachedVolume &cv);
     bool ResolvePath(CachedVolume &cv, const std::vector<std::string> &parts, uint64_t &out_inode, ApfsDir::Inode &out_ino_rec);
 
     std::shared_ptr<CachedHfsVolume> GetOrMountHfsVolume(int drive_num, uint64_t vol_offset, uint32_t sector_size);

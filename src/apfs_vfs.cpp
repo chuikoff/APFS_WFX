@@ -229,14 +229,43 @@ std::shared_ptr<CachedVolume> ApfsVFS::GetOrMountVolume(int drive_num, unsigned 
     return cv;
 }
 
+uint64_t ApfsVFS::VolumeRootInode(CachedVolume &cv)
+{
+    if (cv.root_known)
+        return cv.root_inode;
+
+    uint64_t ino = ROOT_DIR_INO_NUM;
+    std::vector<ApfsDir::DirRec> test_list;
+    if (!cv.dir->ListDirectory(test_list, ROOT_DIR_INO_NUM) || test_list.empty())
+    {
+        std::vector<ApfsDir::DirRec> parent_list;
+        if (cv.dir->ListDirectory(parent_list, ROOT_DIR_PARENT) && !parent_list.empty())
+        {
+            ino = ROOT_DIR_PARENT;
+            for (const auto &p : parent_list)
+            {
+                if (p.name == "root")
+                {
+                    ino = p.file_id;
+                    break;
+                }
+            }
+        }
+    }
+
+    cv.root_inode = ino;
+    cv.root_known = true;
+    return ino;
+}
+
 bool ApfsVFS::ResolvePath(CachedVolume &cv, const std::vector<std::string> &parts, uint64_t &out_inode, ApfsDir::Inode &out_ino_rec)
 {
     if (!cv.dir) return false;
 
-    uint64_t cur_inode = ROOT_DIR_INO_NUM; // Start at Inode 2 (real root directory)
+    uint64_t cur_inode = VolumeRootInode(cv);
     size_t start_idx = 0;
 
-    if (!parts.empty())
+    if (!parts.empty() && cur_inode == ROOT_DIR_INO_NUM)
     {
         if (parts[0] == "root")
         {
@@ -447,7 +476,11 @@ HANDLE ApfsVFS::FindFirst(const WCHAR *path, WIN32_FIND_DATAW *findData)
             }
 
             std::vector<HfsPlus::CatalogItem> hfsItems;
-            chv->volume->ListDirectory(parentCNID, hfsItems);
+            if (!chv->volume->ListDirectory(parentCNID, hfsItems))
+            {
+                SetLastError(ERROR_READ_FAULT);
+                return INVALID_HANDLE_VALUE;
+            }
 
             for (const auto &hitem : hfsItems)
             {
@@ -489,7 +522,7 @@ HANDLE ApfsVFS::FindFirst(const WCHAR *path, WIN32_FIND_DATAW *findData)
                 subpath.push_back(WideToUtf8(parts[i]));
             }
 
-            uint64_t target_inode = ROOT_DIR_INO_NUM;
+            uint64_t target_inode = VolumeRootInode(*cv);
             ApfsDir::Inode target_rec;
             if (!subpath.empty())
             {
@@ -497,30 +530,6 @@ HANDLE ApfsVFS::FindFirst(const WCHAR *path, WIN32_FIND_DATAW *findData)
                 {
                     SetLastError(ERROR_PATH_NOT_FOUND);
                     return INVALID_HANDLE_VALUE;
-                }
-            }
-            else
-            {
-                // Volume root level: check if Inode 2 has entries
-                std::vector<ApfsDir::DirRec> test_list;
-                if (!cv->dir->ListDirectory(test_list, ROOT_DIR_INO_NUM) || test_list.empty())
-                {
-                    std::vector<ApfsDir::DirRec> parent_list;
-                    if (cv->dir->ListDirectory(parent_list, ROOT_DIR_PARENT) && !parent_list.empty())
-                    {
-                        bool found_root = false;
-                        for (const auto &p : parent_list)
-                        {
-                            if (p.name == "root")
-                            {
-                                target_inode = p.file_id;
-                                found_root = true;
-                                break;
-                            }
-                        }
-                        if (!found_root)
-                            target_inode = ROOT_DIR_PARENT;
-                    }
                 }
             }
 
@@ -697,6 +706,18 @@ int ApfsVFS::GetFile(const WCHAR *remoteName, const WCHAR *localName, int copyFl
         }
 
         uint64_t total_size = hfsItem.dataSize;
+        // A broken decmpfs file often has a zero data fork. The copy loop would
+        // otherwise skip the read and return FS_FILE_OK for an empty local file.
+        if (hfsItem.hasDecmpfs && total_size == 0) {
+            uint8_t probe = 0;
+            uint64_t probeRead = 0;
+            if (!chv->volume->ReadFileData(hfsItem, 0, &probe, 1, probeRead)) {
+                CloseHandle(hLocal);
+                DeleteFileW(localName);
+                return FS_FILE_READERROR;
+            }
+        }
+
         constexpr size_t CHUNK = 256 * 1024;
         std::vector<uint8_t> buf(CHUNK);
         uint64_t offset = 0;
@@ -762,27 +783,54 @@ int ApfsVFS::GetFile(const WCHAR *remoteName, const WCHAR *localName, int copyFl
         return FS_FILE_WRITEERROR;
     }
 
-    bool is_compressed = (ino_rec.bsd_flags & APFS_UF_COMPRESSED) != 0 || (ino_rec.internal_flags & INODE_HAS_UNCOMPRESSED_SIZE) != 0;
+    bool compressed_flag = (ino_rec.bsd_flags & APFS_UF_COMPRESSED) != 0
+        || (ino_rec.internal_flags & INODE_HAS_UNCOMPRESSED_SIZE) != 0;
 
-    if (is_compressed)
+    if (compressed_flag)
     {
         std::vector<uint8_t> attr;
-        if (cv->dir->GetAttribute(attr, target_inode, "com.apple.decmpfs"))
+        std::vector<uint8_t> decomp;
+        bool decoded = cv->dir->GetAttribute(attr, target_inode, "com.apple.decmpfs")
+            && DecompressFile(*cv->dir, target_inode, decomp, attr);
+        if ((ino_rec.bsd_flags & APFS_UF_COMPRESSED) != 0 || decoded)
         {
-            std::vector<uint8_t> decomp;
-            if (DecompressFile(*cv->dir, target_inode, decomp, attr))
+            if (!decoded)
             {
-                DWORD written = 0;
-                if (!decomp.empty())
-                {
-                    WriteFile(hLocal, decomp.data(), (DWORD)decomp.size(), &written, nullptr);
-                }
-                if (m_progressProc)
-                    m_progressProc(m_pluginNr, const_cast<WCHAR*>(remoteName), const_cast<WCHAR*>(localName), 100);
-
                 CloseHandle(hLocal);
-                return FS_FILE_OK;
+                DeleteFileW(localName);
+                return FS_FILE_READERROR;
             }
+
+            uint64_t off = 0;
+            const uint64_t total = decomp.size();
+            while (off < total)
+            {
+                DWORD chunk = (DWORD)std::min<uint64_t>(total - off, 256 * 1024);
+                DWORD written = 0;
+                if (!WriteFile(hLocal, decomp.data() + off, chunk, &written, nullptr) || written != chunk)
+                {
+                    CloseHandle(hLocal);
+                    DeleteFileW(localName);
+                    return FS_FILE_WRITEERROR;
+                }
+                off += chunk;
+                if (m_progressProc && total > 0)
+                {
+                    int percent = (int)((off * 100) / total);
+                    if (m_progressProc(m_pluginNr, const_cast<WCHAR*>(remoteName), const_cast<WCHAR*>(localName), percent) != 0)
+                    {
+                        CloseHandle(hLocal);
+                        DeleteFileW(localName);
+                        return FS_FILE_USERABORT;
+                    }
+                }
+            }
+
+            FILETIME ftMod = ApfsNsToFileTime(ino_rec.mod_time);
+            FILETIME ftCreate = ApfsNsToFileTime(ino_rec.create_time);
+            SetFileTime(hLocal, &ftCreate, nullptr, &ftMod);
+            CloseHandle(hLocal);
+            return FS_FILE_OK;
         }
     }
 
@@ -802,6 +850,7 @@ int ApfsVFS::GetFile(const WCHAR *remoteName, const WCHAR *localName, int copyFl
         if (!cv->dir->ReadFile(buffer.data(), ino_rec.private_id, offset, cur_chunk))
         {
             CloseHandle(hLocal);
+            DeleteFileW(localName);
             return FS_FILE_READERROR;
         }
 
@@ -809,6 +858,7 @@ int ApfsVFS::GetFile(const WCHAR *remoteName, const WCHAR *localName, int copyFl
         if (!WriteFile(hLocal, buffer.data(), (DWORD)cur_chunk, &written, nullptr) || written != cur_chunk)
         {
             CloseHandle(hLocal);
+            DeleteFileW(localName);
             return FS_FILE_WRITEERROR;
         }
 
@@ -1202,7 +1252,10 @@ bool ApfsVFS::FindHfsCatalogItem(HfsPlus::HfsPlusVolume &vol, uint32_t parentCNI
     std::vector<HfsPlus::CatalogItem> items;
     if (!vol.ListDirectory(parentCNID, items)) return false;
     for (auto &item : items) {
-        if (_wcsicmp(item.name.c_str(), name.c_str()) == 0) {
+        bool same = vol.IsCaseSensitive()
+            ? (item.name == name)
+            : (_wcsicmp(item.name.c_str(), name.c_str()) == 0);
+        if (same) {
             out = item;
             return true;
         }
